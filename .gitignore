@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# Данные и секреты — НИКОГДА не коммитим
+kazakhstan_data.db
+kazakhstan_data.db-*
+users.db
+users.db-*
+.secret_key
+.env
+data/
+deploy/nginx/certs/
+# Фронтенд
+frontend/node_modules/
+frontend/dist/
+.playwright-mcp/
+*.xlsx

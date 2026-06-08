@@ -1,0 +1,57 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          KZ_JWT_SECRET: ${{ secrets.KZ_JWT_SECRET }}
+          KZ_ADMIN_PASSWORD: ${{ secrets.KZ_ADMIN_PASSWORD }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          envs: KZ_JWT_SECRET,KZ_ADMIN_PASSWORD
+          command_timeout: 30m
+          timeout: 60s
+          script: |
+            set -e
+            cd /home/administrator/kazakhstan_data
+
+            # Подтянуть код (жёсткий reset под ветку origin)
+            git fetch origin ${{ github.ref_name }}
+            git reset --hard origin/${{ github.ref_name }}
+
+            # Создать .env с секретами (НЕ хранится в git)
+            cat > .env << EOF
+            KZ_JWT_SECRET=${KZ_JWT_SECRET}
+            KZ_SECURE_COOKIES=1
+            KZ_ADMIN_USER=admin
+            KZ_ADMIN_PASSWORD=${KZ_ADMIN_PASSWORD}
+            EOF
+
+            # Том БД должен быть смонтирован (Btrfs+zstd). Проверяем.
+            if [ ! -f data/kazakhstan_data.db ]; then
+              echo "ОШИБКА: data/kazakhstan_data.db не найдена — том не смонтирован или база не залита."
+              exit 1
+            fi
+
+            # Сборка и запуск
+            docker compose up -d --build --remove-orphans
+
+            echo "Deploy completed successfully!"
