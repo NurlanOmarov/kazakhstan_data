@@ -266,6 +266,7 @@ export function SearchPage() {
   const openNeighbors = async (rowid: number) => {
     if (pending) return; // уже идёт запрос — игнорируем повторные клики
     setConn(null);
+    setDetail(null); // иначе новая модалка откроется под карточкой «Подробнее»
     setPending({ kind: "neigh", rowid });
     try {
       const res = await fetchNeighbors(rowid);
@@ -283,6 +284,7 @@ export function SearchPage() {
   const openConnections = async (row: Resident) => {
     if (pending) return; // уже идёт запрос — игнорируем повторные клики
     const rowid = Number(row._rowid);
+    setDetail(null); // иначе модалка «Связи» откроется под карточкой «Подробнее»
     setPending({ kind: "conn", rowid });
     try {
       setConn({ focus: row, data: await fetchConnections(rowid) });

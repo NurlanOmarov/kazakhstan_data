@@ -135,9 +135,86 @@ export function ConnectionsGraph({
   const gRefs = useRef<Map<string, SVGGElement>>(new Map());
   const eRefs = useRef<Map<string, SVGPathElement>>(new Map());
   const rafRef = useRef<number>(0);
+  // Камера (зум/пан) — тоже в ref, применяется к обёртке <g> в цикле кадров.
+  const svgRef = useRef<SVGSVGElement>(null);
+  const viewRef = useRef<SVGGElement>(null);
+  const cam = useRef({ scale: 1, tx: 0, ty: 0 });
+  // Активные указатели (для пана одним пальцем и pinch-зума двумя).
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  const pinch = useRef<{ dist: number; cx: number; cy: number } | null>(null);
+
+  /** Клиентские координаты курсора → координаты пространства viewBox. */
+  const clientToSvg = (clientX: number, clientY: number) => {
+    const svg = svgRef.current;
+    if (!svg) return { x: 0, y: 0 };
+    const pt = svg.createSVGPoint();
+    pt.x = clientX; pt.y = clientY;
+    const m = svg.getScreenCTM();
+    if (!m) return { x: 0, y: 0 };
+    const p = pt.matrixTransform(m.inverse());
+    return { x: p.x, y: p.y };
+  };
+
+  /** Масштабирование вокруг точки (px,py) в координатах viewBox. */
+  const zoomAround = (px: number, py: number, factor: number) => {
+    const c = cam.current;
+    const ns = Math.min(3.5, Math.max(0.45, c.scale * factor));
+    const wx = (px - c.tx) / c.scale, wy = (py - c.ty) / c.scale;
+    c.tx = px - wx * ns; c.ty = py - wy * ns; c.scale = ns;
+  };
+
+  // Колесо мыши — зум к курсору (passive:false, чтобы можно было preventDefault).
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const p = clientToSvg(e.clientX, e.clientY);
+      zoomAround(p.x, p.y, e.deltaY < 0 ? 1.12 : 1 / 1.12);
+    };
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", onWheel);
+  }, []);
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    if ((e.target as Element).closest(".cnode")) return; // клик по узлу — не пан
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    pinch.current = null; // переинициализируется при первом move с двумя пальцами
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    const prev = pointers.current.get(e.pointerId);
+    if (!prev) return;
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const pts = [...pointers.current.values()];
+    if (pts.length >= 2) {
+      // Pinch-зум двумя пальцами: масштаб по изменению расстояния + пан середины.
+      const [a, b] = pts;
+      const dist = Math.hypot(b.x - a.x, b.y - a.y);
+      const mid = clientToSvg((a.x + b.x) / 2, (a.y + b.y) / 2);
+      if (pinch.current && pinch.current.dist > 0) {
+        zoomAround(mid.x, mid.y, dist / pinch.current.dist);
+        cam.current.tx += mid.x - pinch.current.cx;
+        cam.current.ty += mid.y - pinch.current.cy;
+      }
+      pinch.current = { dist, cx: mid.x, cy: mid.y };
+    } else {
+      // Пан одним пальцем/мышью.
+      const p1 = clientToSvg(e.clientX, e.clientY);
+      const p0 = clientToSvg(prev.x, prev.y);
+      cam.current.tx += p1.x - p0.x;
+      cam.current.ty += p1.y - p0.y;
+    }
+  };
+  const onPointerUp = (e: React.PointerEvent) => {
+    pointers.current.delete(e.pointerId);
+    if (pointers.current.size < 2) pinch.current = null;
+  };
+  const resetCam = () => { cam.current = { scale: 1, tx: 0, ty: 0 }; };
 
   // Перестроить физические узлы при смене корня (вылетают из центра).
   useEffect(() => {
+    resetCam(); // новый корень — возвращаем камеру в исходный масштаб/центр
     const pos = layout(sats);
     const posById = new Map(pos.map((p) => [p.id, p]));
     const now = performance.now();
@@ -158,6 +235,11 @@ export function ConnectionsGraph({
     const k = 0.09, damping = 0.82;
     const tick = () => {
       const now = performance.now();
+      const v = viewRef.current;
+      if (v) {
+        const c = cam.current;
+        v.setAttribute("transform", `translate(${c.tx} ${c.ty}) scale(${c.scale})`);
+      }
       for (const n of physRef.current) {
         const wob = Math.sin((now - n.born) / 900 + n.delay) * 0.5;
         n.vx += (n.tx + wob - n.x) * k;
@@ -227,8 +309,16 @@ export function ConnectionsGraph({
 
       <div className="cgraph-stage">
         {loading && <div className="cgraph-loading"><span className="btn-spin" /> загрузка связей…</div>}
-        <svg viewBox={`0 0 ${VIEW_W} ${VIEW_H}`} className="cgraph-svg"
-          role="img" aria-label="Граф связей">
+        <div className="cgraph-zoom">
+          <button title="Приблизить" onClick={() => zoomAround(VIEW_W / 2, VIEW_H / 2, 1.25)}>+</button>
+          <button title="Отдалить" onClick={() => zoomAround(VIEW_W / 2, VIEW_H / 2, 1 / 1.25)}>−</button>
+          <button title="Сбросить вид" onClick={resetCam} className="reset">⟲</button>
+        </div>
+        <svg ref={svgRef} viewBox={`0 0 ${VIEW_W} ${VIEW_H}`} className="cgraph-svg"
+          role="img" aria-label="Граф связей"
+          onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
+          onPointerLeave={onPointerUp}>
           <defs>
             <radialGradient id="cg-core" cx="50%" cy="40%" r="70%">
               <stop offset="0%" stopColor="var(--cg-core-1)" />
@@ -236,37 +326,39 @@ export function ConnectionsGraph({
             </radialGradient>
           </defs>
 
-          {/* Рёбра (под узлами) */}
-          <g className="cgraph-edges">
-            {sats.map((n) => (
-              <path key={n.id} className={`cedge ${n.tone}`}
-                ref={(el) => { if (el) eRefs.current.set(n.id, el); else eRefs.current.delete(n.id); }}
-                d={`M ${CX} ${CY} ${CX} ${CY}`} fill="none" />
-            ))}
-          </g>
-
-          {/* Спутники */}
-          {sats.map((n) => (
-            <g key={n.id} className={`cnode ${n.tone}${hover === n.id ? " hover" : ""}`}
-              ref={(el) => { if (el) gRefs.current.set(n.id, el); else gRefs.current.delete(n.id); }}
-              onMouseEnter={() => setHover(n.id)} onMouseLeave={() => setHover(null)}
-              onClick={() => explore(n)}
-              style={{ cursor: "pointer" }}>
-              <title>{`${n.label}${n.sub ? " · " + n.sub : ""}${n.relation ? "\n" + n.relation : ""}\n(клик — раскрыть связи)`}</title>
-              <circle className="cnode-halo" r={n.r + 6} />
-              <circle className="cnode-core" r={n.r} />
-              <text className="cnode-label" y={n.r + 14}>{n.label}</text>
+          <g ref={viewRef}>
+            {/* Рёбра (под узлами) */}
+            <g className="cgraph-edges">
+              {sats.map((n) => (
+                <path key={n.id} className={`cedge ${n.tone}`}
+                  ref={(el) => { if (el) eRefs.current.set(n.id, el); else eRefs.current.delete(n.id); }}
+                  d={`M ${CX} ${CY} ${CX} ${CY}`} fill="none" />
+              ))}
             </g>
-          ))}
 
-          {/* Центр */}
-          <g className="cnode center" transform={`translate(${CX} ${CY})`}
-            onClick={() => root.row && onOpenCard(root.row)}
-            style={{ cursor: root.row ? "pointer" : "default" }}>
-            <title>{`${center.label}${center.sub ? " · " + center.sub : ""}\n(клик — карточка)`}</title>
-            <circle className="cnode-pulse" r={center.r + 10} />
-            <circle r={center.r} fill="url(#cg-core)" stroke="var(--cg-core-stroke)" strokeWidth={2} />
-            <text className="cnode-label center" y={center.r + 18}>{center.label}</text>
+            {/* Спутники */}
+            {sats.map((n) => (
+              <g key={n.id} className={`cnode ${n.tone}${hover === n.id ? " hover" : ""}`}
+                ref={(el) => { if (el) gRefs.current.set(n.id, el); else gRefs.current.delete(n.id); }}
+                onMouseEnter={() => setHover(n.id)} onMouseLeave={() => setHover(null)}
+                onClick={() => explore(n)}
+                style={{ cursor: "pointer" }}>
+                <title>{`${n.label}${n.sub ? " · " + n.sub : ""}${n.relation ? "\n" + n.relation : ""}\n(клик — раскрыть связи)`}</title>
+                <circle className="cnode-halo" r={n.r + 6} />
+                <circle className="cnode-core" r={n.r} />
+                <text className="cnode-label" y={n.r + 14}>{n.label}</text>
+              </g>
+            ))}
+
+            {/* Центр */}
+            <g className="cnode center" transform={`translate(${CX} ${CY})`}
+              onClick={() => root.row && onOpenCard(root.row)}
+              style={{ cursor: root.row ? "pointer" : "default" }}>
+              <title>{`${center.label}${center.sub ? " · " + center.sub : ""}\n(клик — карточка)`}</title>
+              <circle className="cnode-pulse" r={center.r + 10} />
+              <circle r={center.r} fill="url(#cg-core)" stroke="var(--cg-core-stroke)" strokeWidth={2} />
+              <text className="cnode-label center" y={center.r + 18}>{center.label}</text>
+            </g>
           </g>
         </svg>
       </div>
@@ -274,7 +366,7 @@ export function ConnectionsGraph({
       <div className="cgraph-foot">
         <span><b>{relCount}</b> родня · <b>{phCount}</b> по телефону</span>
         {hidden > 0 && <span className="muted">показаны не все: +{hidden} скрыто</span>}
-        <span className="muted">клик по узлу — раскрыть связи · по центру — карточка</span>
+        <span className="muted">клик по узлу — связи · по центру — карточка · колесо — зум · тяни — перемещение</span>
       </div>
     </div>
   );
