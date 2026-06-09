@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   adminListUsers, adminCreateUser, adminUpdateUser, adminResetPassword,
   adminDeleteUser, adminAudit, adminStats,
@@ -34,10 +34,46 @@ export function Admin() {
   );
 }
 
+/** Разбор детали аномалии в человекочитаемое объяснение. */
+function explainAnomaly(detail: string): { action: string; text: string } {
+  let reason = detail;
+  try {
+    const obj = JSON.parse(detail);
+    reason = obj?.reason ?? detail;
+  } catch { /* оставляем как есть */ }
+  const m = /^(\w+):\s*больше\s*(\d+)/.exec(String(reason));
+  if (m) {
+    const action = m[1] === "export" ? "экспорт" : m[1] === "search" ? "поиск" : m[1];
+    return {
+      action,
+      text: `Превышен часовой порог: ${action} — более ${m[2]} за час. ` +
+        `Возможен массовый сбор данных или скомпрометированная учётка.`,
+    };
+  }
+  return { action: "—", text: String(reason) };
+}
+
 function Dashboard() {
+  const toast = useToast();
   const [stats, setStats] = useState<Stats | null>(null);
   const [days, setDays] = useState(7);
-  useEffect(() => { adminStats(days).then(setStats).catch(() => setStats(null)); }, [days]);
+  const reload = useCallback(
+    () => adminStats(days).then(setStats).catch(() => setStats(null)),
+    [days],
+  );
+  useEffect(() => { reload(); }, [reload]);
+
+  const blockUser = async (uid: number | null, username: string) => {
+    if (!uid) { toast("Не удалось определить пользователя", "err"); return; }
+    try {
+      await adminUpdateUser(uid, { is_active: 0 });
+      toast(`Пользователь ${username} заблокирован`);
+      reload();
+    } catch (e) {
+      toast((e as Error).message, "err");
+    }
+  };
+
   if (!stats) return <div className="empty">Загрузка статистики…</div>;
 
   const a = stats.by_action;
@@ -105,17 +141,31 @@ function Dashboard() {
       {stats.anomalies.length > 0 && (
         <section className="dash-block warn-block">
           <h3><Icon name="alert" size={17} /> Аномалии активности</h3>
-          <table className="admin-table">
-            <thead><tr><th>Время</th><th>Пользователь</th><th>Детали</th></tr></thead>
-            <tbody>
-              {stats.anomalies.map((an, i) => (
-                <tr key={i}>
-                  <td>{formatDateTime(an.ts)}</td><td>{an.username}</td>
-                  <td className="addr">{an.detail}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <p className="muted anomaly-hint">
+            Срабатывают при всплеске активности одного пользователя сверх часового порога.
+            Проверьте журнал действий этого пользователя; при подозрении — заблокируйте учётку.
+          </p>
+          <div className="anomaly-timeline">
+            {stats.anomalies.map((an, i) => {
+              const ex = explainAnomaly(an.detail);
+              return (
+                <div className="anomaly-item" key={i}>
+                  <div className="anomaly-dot" aria-hidden="true" />
+                  <div className="anomaly-body">
+                    <div className="anomaly-top">
+                      <span className="anomaly-user">{an.username || "—"}</span>
+                      <span className={`tag tag-${ex.action === "экспорт" ? "export" : "search"}`}>{ex.action}</span>
+                      <span className="muted">{formatDateTime(an.ts)}</span>
+                    </div>
+                    <div className="anomaly-text">{ex.text}</div>
+                  </div>
+                  <button className="btn-danger sm" onClick={() => blockUser(an.user_id, an.username)}>
+                    Заблокировать
+                  </button>
+                </div>
+              );
+            })}
+          </div>
         </section>
       )}
     </div>

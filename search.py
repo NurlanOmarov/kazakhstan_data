@@ -179,6 +179,19 @@ def _refine_filters(params: dict, today: datetime.date | None = None):
         where.append('r."Пол" = ?')
         args.append(gender)
 
+    # Гражданство / Национальность — точный префиксный фильтр. Регистр
+    # кириллицы SQLite не сворачивает (UPPER/NOCASE работают лишь для ASCII),
+    # поэтому генерируем варианты регистра в Python и матчим через OR LIKE.
+    for form_field, col in (("Гражданство", "Гражданство"),
+                            ("Национальность", "Национальность")):
+        v = (params.get(form_field) or "").strip()
+        if not v:
+            continue
+        variants = list(dict.fromkeys([v, v.upper(), v.lower(), v.capitalize()]))
+        ors = " OR ".join(f'r."{col}" LIKE ?' for _ in variants)
+        where.append(f"({ors})")
+        args += [f"{x}%" for x in variants]
+
     today = today or datetime.date.today()
     age_min = _parse_age(params.get("Возраст от"))
     age_max = _parse_age(params.get("Возраст до"))
@@ -610,6 +623,49 @@ def connections(conn: sqlite3.Connection, rowid: int, limit: int = 100) -> dict:
         logging.error("connections failed: %s", e)
         return {"relatives": [], "relatives_total": 0, "phone": [],
                 "phone_total": 0, "phones": [], "error": "Внутренняя ошибка"}
+
+
+def phone_lookup(conn: sqlite3.Connection, phone: str, limit: int = 50,
+                 offset: int = 0) -> dict:
+    """
+    Обратный поиск по телефону: все жители базы, у которых заданный номер
+    встречается в любом из телефонных полей (мобильный/рабочий/домашний).
+    Учитываются варианты префикса 7/8 и формат записи (как в `connections`).
+    """
+    try:
+        variants = sorted(_phone_variants(phone))
+        if not variants:
+            return {"results": [], "total": 0, "error": None}
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        cols = "{" + " ".join(PHONE_NORM_COLS) + "}"
+        match = " OR ".join(f'{cols} : "{p}"' for p in variants)
+        base = (f"FROM {FTS} f JOIN {TABLE} r ON r.rowid=f.rowid "
+                f"WHERE {FTS} MATCH ?")
+        total = conn.execute(f"SELECT COUNT(*) {base}", [match]).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT r.rowid AS _rowid, r.* {base} LIMIT ? OFFSET ?",
+            [match, limit, offset],
+        ).fetchall()
+        return {"results": [_strip_internal(dict(r)) for r in rows],
+                "total": total, "error": None}
+    except sqlite3.Error as e:
+        logging.error("phone_lookup failed: %s", e)
+        return {"results": [], "total": 0, "error": "Внутренняя ошибка"}
+
+
+def rows_by_ids(conn: sqlite3.Connection, rowids: list[int]) -> list[dict]:
+    """Записи по списку rowid (для экспорта выбранных строк). Порядок — как задан."""
+    ids = [int(x) for x in rowids][:1000]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT r.rowid AS _rowid, r.* FROM {TABLE} r "
+        f"WHERE r.rowid IN ({placeholders})", ids,
+    ).fetchall()
+    by_id = {r["_rowid"]: _strip_internal(dict(r)) for r in rows}
+    return [by_id[i] for i in ids if i in by_id]
 
 
 def suggest(conn: sqlite3.Connection, field: str, query: str, limit: int = 10):

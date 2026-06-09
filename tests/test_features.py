@@ -276,3 +276,58 @@ def test_stats_forbidden_for_user(client):
         "username": "stuser", "password": "User12345!", "role": "user"})
     u.post("/api/login", data={"username": "stuser", "password": "User12345!"})
     assert u.get("/api/admin/stats").status_code == 403
+
+
+# ---------- Обратный поиск по телефону ----------
+def test_phone_lookup(client):
+    """Режим «по телефону»: находит владельца номера из его же записи."""
+    rowid, row = _first_rowid(client, inn=INN)
+    detail = client.get("/api/search", params={"inn": INN}).json()["results"][0]
+    phone = str(detail.get("Мобильный") or "").split(",")[0].strip()
+    if not phone:
+        pytest.skip("у тестовой записи нет телефона")
+    r = client.get("/api/phone_lookup", params={"phone": phone})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] >= 1
+    assert body["mode"] == "exact"
+    found = {int(x["_rowid"]) for x in body["results"]}
+    assert rowid in found
+
+
+def test_phone_lookup_requires_phone(client):
+    assert client.get("/api/phone_lookup", params={"phone": ""}).status_code == 400
+
+
+# ---------- Экспорт выбранных строк (bulk) ----------
+def test_export_rows(client):
+    rowid, _ = _first_rowid(client, inn=INN)
+    r = client.post("/api/export_rows", json={"rowids": [rowid]})
+    assert r.status_code == 200
+    assert "spreadsheet" in r.headers.get("content-type", "")
+    assert int(r.headers.get("content-length", "1")) > 0
+
+
+def test_export_rows_empty(client):
+    assert client.post("/api/export_rows", json={"rowids": []}).status_code == 400
+
+
+# ---------- Фильтр по гражданству/национальности ----------
+def test_search_with_citizenship_filter(client):
+    """Фильтр гражданства не ломает поиск и не расширяет выборку."""
+    base = client.get("/api/search", params={"surname": "ДОЩАНОВ"}).json()
+    if base["total"] == 0:
+        pytest.skip("нет данных по фамилии")
+    citi = str(base["results"][0].get("Гражданство") or "").strip()
+    if not citi:
+        pytest.skip("нет значения гражданства")
+    r = client.get("/api/search", params={"surname": "ДОЩАНОВ", "citizenship": citi})
+    assert r.status_code == 200
+    assert r.json()["total"] <= base["total"]
+
+
+# ---------- Аномалии содержат user_id (для блокировки в 1 клик) ----------
+def test_anomalies_include_user_id(client):
+    body = client.get("/api/admin/stats", params={"days": 7}).json()
+    for an in body["anomalies"]:
+        assert "user_id" in an

@@ -34,10 +34,19 @@ DEV_CORS = os.environ.get("KZ_DEV_CORS", "0") == "1"
 
 
 def client_ip(request: Request) -> str:
-    """IP клиента с учётом reverse-proxy (nginx ставит X-Forwarded-For)."""
+    """
+    IP клиента с учётом reverse-proxy.
+
+    Берём ПОСЛЕДНИЙ элемент X-Forwarded-For — его добавляет наш nginx
+    ($proxy_add_x_forwarded_for дописывает реальный $remote_addr в конец).
+    Первые элементы клиент может подделать сам, поэтому им доверять нельзя:
+    иначе обходится rate-limit и фальсифицируется IP в аудит-логе.
+    """
     xff = request.headers.get("x-forwarded-for")
     if xff:
-        return xff.split(",")[0].strip()
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
     return request.client.host if request.client else ""
 
 
@@ -233,6 +242,8 @@ def _params_from_query(**kw):
         "Улица": kw.get("street", ""), "Дом": kw.get("house", ""),
         "Пол": kw.get("gender", ""),
         "Возраст от": kw.get("age_min", ""), "Возраст до": kw.get("age_max", ""),
+        "Гражданство": kw.get("citizenship", ""),
+        "Национальность": kw.get("nationality", ""),
     }
 
 
@@ -243,19 +254,20 @@ def api_search(request: Request, user=Depends(current_user),
                phone: str = "", address: str = "", city: str = "",
                district: str = "", street: str = "", house: str = "",
                gender: str = "", age_min: str = "", age_max: str = "",
+               citizenship: str = "", nationality: str = "",
                page: int = 1, page_size: int = 50,
                sort_by: str = "", sort_dir: str = "asc"):
     page = max(1, page)
     page_size = max(1, min(page_size, 200))
     with users_conn() as uc:
         limit = auth.effective_limit(user, "search")
-        if auth.count_today(uc, user["id"], "search") >= limit:
-            raise HTTPException(429, f"Превышен дневной лимит поисков ({limit})")
+        if auth.count_today_any(uc, user["id"], auth.LOOKUP_ACTIONS) >= limit:
+            raise HTTPException(429, f"Превышен дневной лимит запросов ({limit})")
     params = _params_from_query(
         fio=fio, surname=surname, name=name, patronymic=patronymic, dob=dob,
         inn=inn, phone=phone, address=address, city=city, district=district,
         street=street, house=house, gender=gender, age_min=age_min,
-        age_max=age_max)
+        age_max=age_max, citizenship=citizenship, nationality=nationality)
     with data_conn() as dc:
         result = S.search(dc, params, limit=page_size,
                           offset=(page - 1) * page_size,
@@ -279,6 +291,10 @@ def api_suggest(field: str, q: str, user=Depends(current_user)):
 
 @app.get("/api/neighbors")
 def api_neighbors(request: Request, rowid: int, user=Depends(current_user)):
+    with users_conn() as uc:
+        limit = auth.effective_limit(user, "search")
+        if auth.count_today_any(uc, user["id"], auth.LOOKUP_ACTIONS) >= limit:
+            raise HTTPException(429, f"Превышен дневной лимит запросов ({limit})")
     with data_conn() as dc:
         result = S.neighbors(dc, rowid, limit=100)
     result["fields"] = S.DISPLAY_FIELDS
@@ -290,6 +306,10 @@ def api_neighbors(request: Request, rowid: int, user=Depends(current_user)):
 
 @app.get("/api/connections")
 def api_connections(request: Request, rowid: int, user=Depends(current_user)):
+    with users_conn() as uc:
+        limit = auth.effective_limit(user, "search")
+        if auth.count_today_any(uc, user["id"], auth.LOOKUP_ACTIONS) >= limit:
+            raise HTTPException(429, f"Превышен дневной лимит запросов ({limit})")
     with data_conn() as dc:
         result = S.connections(dc, rowid, limit=100)
     result["fields"] = S.DISPLAY_FIELDS
@@ -372,8 +392,14 @@ def delete_bookmark(bid: int, user=Depends(current_user)):
 @app.post("/api/2fa/setup")
 def twofa_setup(user=Depends(current_user)):
     """Сгенерировать секрет (ещё не активен) и вернуть данные для приложения."""
-    secret = auth.gen_totp_secret()
+    # Если 2FA уже включён — не даём перегенерировать секрет (иначе повторный
+    # вызов сбросил бы totp_enabled и отключил защиту без пароля/кода).
+    # Сначала /2fa/disable, потом заново /2fa/setup.
     with users_conn() as uc:
+        fresh = auth.get_user_by_id(uc, user["id"])
+        if fresh["totp_enabled"]:
+            raise HTTPException(409, "2FA уже включён — сначала отключите его")
+        secret = auth.gen_totp_secret()
         auth.set_totp_secret(uc, user["id"], secret)
     return {"secret": secret, "uri": auth.totp_uri(user["username"], secret)}
 
@@ -411,7 +437,8 @@ def api_export(request: Request, user=Depends(current_user),
                patronymic: str = "", dob: str = "", inn: str = "",
                phone: str = "", address: str = "", city: str = "",
                district: str = "", street: str = "", house: str = "",
-               gender: str = "", age_min: str = "", age_max: str = ""):
+               gender: str = "", age_min: str = "", age_max: str = "",
+               citizenship: str = "", nationality: str = ""):
     with users_conn() as uc:
         limit = auth.effective_limit(user, "export")
         if auth.count_today(uc, user["id"], "export") >= limit:
@@ -420,24 +447,13 @@ def api_export(request: Request, user=Depends(current_user),
         fio=fio, surname=surname, name=name, patronymic=patronymic, dob=dob,
         inn=inn, phone=phone, address=address, city=city, district=district,
         street=street, house=house, gender=gender, age_min=age_min,
-        age_max=age_max)
+        age_max=age_max, citizenship=citizenship, nationality=nationality)
     with data_conn() as dc:
         result = S.search(dc, params, limit=auth.EXPORT_MAX_ROWS, offset=0)
     rows = result["results"]
     if not rows:
         raise HTTPException(404, "Нет данных для экспорта")
-
-    from openpyxl import Workbook
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Результаты"
-    ws.append(S.DISPLAY_FIELDS)
-    for r in rows:
-        ws.append([r.get(c, "") for c in S.DISPLAY_FIELDS])
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-
+    buf = _build_xlsx(rows)
     with users_conn() as uc:
         auth.audit(uc, action="export", user=user, ip=client_ip(request),
                    detail={k: v for k, v in params.items() if v},
@@ -448,6 +464,80 @@ def api_export(request: Request, user=Depends(current_user),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": 'attachment; filename="export.xlsx"'},
     )
+
+
+def _build_xlsx(rows: list[dict]) -> io.BytesIO:
+    """Собирает xlsx из списка записей по DISPLAY_FIELDS."""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Результаты"
+    ws.append(S.DISPLAY_FIELDS)
+    for r in rows:
+        ws.append([r.get(c, "") for c in S.DISPLAY_FIELDS])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+@app.post("/api/export_rows")
+def api_export_rows(request: Request, user=Depends(current_user),
+                    payload: dict = None):
+    """Экспорт в Excel выбранных строк (bulk) по списку rowid."""
+    payload = payload or {}
+    raw = payload.get("rowids")
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(400, "Не переданы строки для экспорта")
+    try:
+        rowids = [int(x) for x in raw][:1000]
+    except (ValueError, TypeError):
+        raise HTTPException(400, "Некорректный список строк")
+    with users_conn() as uc:
+        limit = auth.effective_limit(user, "export")
+        if auth.count_today(uc, user["id"], "export") >= limit:
+            raise HTTPException(429, f"Превышен дневной лимит экспортов ({limit})")
+    with data_conn() as dc:
+        rows = S.rows_by_ids(dc, rowids)
+    if not rows:
+        raise HTTPException(404, "Нет данных для экспорта")
+    buf = _build_xlsx(rows)
+    with users_conn() as uc:
+        auth.audit(uc, action="export", user=user, ip=client_ip(request),
+                   detail={"selected": len(rows)}, result_count=len(rows))
+        _note_anomaly(uc, user, "export", client_ip(request))
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="export-selected.xlsx"'},
+    )
+
+
+@app.get("/api/phone_lookup")
+def api_phone_lookup(request: Request, phone: str, user=Depends(current_user),
+                     page: int = 1, page_size: int = 50):
+    """Обратный поиск по телефону: все владельцы номера по всей базе."""
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
+    if not (phone or "").strip():
+        raise HTTPException(400, "Укажите номер телефона")
+    with users_conn() as uc:
+        limit = auth.effective_limit(user, "search")
+        if auth.count_today_any(uc, user["id"], auth.LOOKUP_ACTIONS) >= limit:
+            raise HTTPException(429, f"Превышен дневной лимит запросов ({limit})")
+    with data_conn() as dc:
+        result = S.phone_lookup(dc, phone, limit=page_size,
+                                offset=(page - 1) * page_size)
+    result["fields"] = S.DISPLAY_FIELDS
+    result["mode"] = "exact"
+    result["page"] = page
+    result["page_size"] = page_size
+    result["count"] = len(result["results"])
+    with users_conn() as uc:
+        auth.audit(uc, action="search", user=user, ip=client_ip(request),
+                   detail={"Мобильный": phone}, result_count=result["total"])
+        _note_anomaly(uc, user, "search", client_ip(request))
+    return result
 
 
 # ---------- Админ: пользователи ----------
@@ -573,11 +663,20 @@ def health():
 if FRONTEND_DIST.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
+    _DIST_ROOT = FRONTEND_DIST.resolve()
+
     @app.get("/{path:path}")
     def spa(path: str):
         if path.startswith("api/"):
             raise HTTPException(404)
-        target = FRONTEND_DIST / path
-        if path and target.is_file():
-            return FileResponse(target)
+        if path:
+            # Защита от path traversal: отдаём файл только если он реально
+            # лежит ВНУТРИ frontend/dist (resolve() схлопывает «..»).
+            try:
+                target = (FRONTEND_DIST / path).resolve()
+                target.relative_to(_DIST_ROOT)
+                if target.is_file():
+                    return FileResponse(target)
+            except (ValueError, OSError):
+                pass
         return FileResponse(FRONTEND_DIST / "index.html")

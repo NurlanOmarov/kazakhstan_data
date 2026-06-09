@@ -51,6 +51,14 @@ def _secret_key() -> str:
     env = os.environ.get("KZ_JWT_SECRET")
     if env:
         return env
+    # Прод (Secure-cookie включён) без явного секрета — это опасно: эфемерный
+    # ключ разлогинивает всех при рестарте, а .secret_key в read-only контейнере
+    # недоступен. Падаем сразу, чтобы проблему заметили при деплое, а не в проде.
+    if os.environ.get("KZ_SECURE_COOKIES", "1") == "1":
+        raise RuntimeError(
+            "KZ_JWT_SECRET не задан в прод-режиме (KZ_SECURE_COOKIES=1). "
+            "Сгенерируйте: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
     path = Path(__file__).parent / ".secret_key"
     try:
         if path.exists():
@@ -323,6 +331,20 @@ def count_today(conn, uid: int, action: str) -> int:
     ).fetchone()[0]
 
 
+# Действия «извлечения записей»: считаются в общую дневную квоту поиска, чтобы
+# перебор rowid через neighbors/connections нельзя было использовать в обход лимита.
+LOOKUP_ACTIONS = ("search", "neighbors", "connections")
+
+
+def count_today_any(conn, uid: int, actions) -> int:
+    start = _iso(now().replace(hour=0, minute=0, second=0, microsecond=0))
+    ph = ",".join("?" * len(actions))
+    return conn.execute(
+        f"SELECT COUNT(*) FROM audit_log WHERE user_id=? AND action IN ({ph}) AND ts>=?",
+        (uid, *actions, start),
+    ).fetchone()[0]
+
+
 def effective_limit(user, action: str) -> int:
     if action == "search":
         return user["daily_search_limit"] or DEFAULT_DAILY_SEARCH
@@ -479,7 +501,7 @@ def stats_overview(conn, days: int = 7) -> dict:
         "SELECT COUNT(*) FROM audit_log WHERE action='login_fail' AND ts>=?",
         (since,)).fetchone()[0]
     anomalies = [dict(r) for r in conn.execute(
-        "SELECT ts, username, detail FROM audit_log "
+        "SELECT ts, user_id, username, detail FROM audit_log "
         "WHERE action='anomaly' AND ts>=? ORDER BY id DESC LIMIT 20", (since,))]
     return {"days": days, "by_action": by_action, "top_users": top_users,
             "by_day": by_day, "failed_logins": failed_logins,

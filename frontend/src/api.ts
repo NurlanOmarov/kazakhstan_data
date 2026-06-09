@@ -29,6 +29,8 @@ export interface SearchParams {
   gender?: string;
   age_min?: string;
   age_max?: string;
+  citizenship?: string;
+  nationality?: string;
   page?: number;
   page_size?: number;
   sort_by?: string;
@@ -156,6 +158,46 @@ export async function fetchNeighbors(
 
 export function exportUrl(params: SearchParams): string {
   return `/api/export?${qs(params as Record<string, unknown>)}`;
+}
+
+/** Обратный поиск по телефону: все владельцы номера по всей базе. */
+export async function phoneLookup(
+  phone: string, page = 1, signal?: AbortSignal,
+): Promise<SearchResponse> {
+  const res = await fetch(
+    `/api/phone_lookup?${qs({ phone, page, page_size: 50 })}`,
+    { ...JSON_OPTS, signal },
+  );
+  return handle(res);
+}
+
+/** Экспорт выбранных строк (bulk) в Excel — скачивает файл в браузере. */
+export async function exportRows(rowids: number[]): Promise<void> {
+  const res = await fetch("/api/export_rows", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rowids }),
+    credentials: "include",
+  });
+  if (!res.ok) {
+    let msg = `Ошибка ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body.detail) msg = body.detail;
+    } catch {
+      /* ignore */
+    }
+    throw new ApiError(msg, res.status);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "export-selected.xlsx";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 // ---------- Admin ----------
@@ -302,7 +344,7 @@ export interface Stats {
   top_users: { username: string; searches: number; exports: number; total: number }[];
   by_day: { day: string; searches: number; exports: number; logins: number }[];
   failed_logins: number;
-  anomalies: { ts: string; username: string; detail: string }[];
+  anomalies: { ts: string; user_id: number | null; username: string; detail: string }[];
 }
 
 export async function adminStats(days = 7): Promise<Stats> {

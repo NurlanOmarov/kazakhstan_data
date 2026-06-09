@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Resident } from "./api";
 import { highlight } from "./highlight";
 import {
@@ -35,18 +36,29 @@ interface MaskApi {
   reveal: (rowid: number | string | null | undefined, col: string) => void;
 }
 
+/** Выбор строк (bulk). null — режим без выбора (например, в карточке-модалке). */
+interface Selection {
+  ids: Set<number>;
+  toggle: (rowid: number) => void;
+  toggleAllVisible: () => void;
+  allVisibleSelected: boolean;
+  someVisibleSelected: boolean;
+}
+
 interface Props {
   rows: Resident[];
-  fields: string[];
+  fields: string[];            // все поля (для копирования/карточек)
+  displayFields: string[];     // видимые колонки таблицы (настройка колонок)
   tokens: string[];
   sortBy: string;
   sortDir: string;
   onSort: (col: string) => void;
   onNeighbors: (rowid: number) => void;
   onDetails: (row: Resident) => void;
-  onConnections?: (rowid: number) => void;
+  onConnections?: (row: Resident) => void;
   onBookmark?: (row: Resident) => void;
   pending?: Pending;
+  selection?: Selection;
 }
 
 /** Какая кнопка «Связи»/«Соседи» сейчас грузит данные (для спиннера и блокировки). */
@@ -91,14 +103,17 @@ function MaskedCell({
  */
 export function ResidentCard({
   row, fields, tokens, onNeighbors, onConnections, onBookmark, pending,
+  selected, onToggleSelect,
 }: {
   row: Resident;
   fields: string[];
   tokens: string[];
   onNeighbors: (rowid: number) => void;
-  onConnections?: (rowid: number) => void;
+  onConnections?: (row: Resident) => void;
   onBookmark?: (row: Resident) => void;
   pending?: Pending;
+  selected?: boolean;
+  onToggleSelect?: () => void;
 }) {
   const push = useToast();
   const mask = useMask();
@@ -107,8 +122,12 @@ export function ResidentCard({
   const connLoading = pending?.kind === "conn" && pending.rowid === rowid;
   const neighLoading = pending?.kind === "neigh" && pending.rowid === rowid;
   return (
-    <div className="card">
+    <div className={`card${selected ? " selected" : ""}`}>
       <div className="card-name">
+        {onToggleSelect && (
+          <input type="checkbox" className="row-check" checked={!!selected}
+            onChange={onToggleSelect} aria-label="Выбрать запись" />
+        )}
         {highlight(
           NAME_FIELDS.map((c) => row[c]).filter(Boolean).join(" "),
           tokens,
@@ -140,7 +159,7 @@ export function ResidentCard({
           <button
             className="link-btn"
             disabled={busy}
-            onClick={() => onConnections(rowid)}
+            onClick={() => onConnections(row)}
           >
             {connLoading ? <Spin /> : <Icon name="link" size={15} />} Связи
           </button>
@@ -211,12 +230,33 @@ function renderCell(
 }
 
 export function ResultsTable({
-  rows, fields, tokens, sortBy, sortDir, onSort, onNeighbors, onDetails,
-  onConnections, onBookmark, pending,
+  rows, fields, displayFields, tokens, sortBy, sortDir, onSort, onNeighbors,
+  onDetails, onConnections, onBookmark, pending, selection,
 }: Props) {
   const push = useToast();
   const mask = useMask();
   const busy = !!pending;
+  const wrapRef = useRef<HTMLDivElement>(null);
+  // Тени-индикаторы по краям при горизонтальном скролле широкой таблицы.
+  const [edge, setEdge] = useState({ left: false, right: false });
+
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const update = () => {
+      const left = el.scrollLeft > 4;
+      const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 4;
+      setEdge((e) => (e.left === left && e.right === right ? e : { left, right }));
+    };
+    update();
+    el.addEventListener("scroll", update, { passive: true });
+    window.addEventListener("resize", update);
+    return () => {
+      el.removeEventListener("scroll", update);
+      window.removeEventListener("resize", update);
+    };
+  }, [rows, displayFields]);
+
   const sortGlyph = (c: string) => {
     if (!SORTABLE.has(c)) return null;
     const active = sortBy === c;
@@ -238,16 +278,30 @@ export function ResultsTable({
   return (
     <>
       {/* Десктоп — таблица */}
-      <div className="table-wrap">
+      <div
+        ref={wrapRef}
+        className={`table-wrap sticky-table${selection ? " has-check" : ""}${edge.left ? " edge-left" : ""}${edge.right ? " edge-right" : ""}`}
+      >
         <table>
           <thead>
             <tr>
-              {fields.map((c) => {
+              {selection && (
+                <th className="col-check sticky-col">
+                  <input
+                    type="checkbox"
+                    aria-label="Выбрать все на странице"
+                    checked={selection.allVisibleSelected}
+                    ref={(el) => { if (el) el.indeterminate = selection.someVisibleSelected && !selection.allVisibleSelected; }}
+                    onChange={selection.toggleAllVisible}
+                  />
+                </th>
+              )}
+              {displayFields.map((c, idx) => {
                 const sortable = SORTABLE.has(c);
                 return (
                   <th
                     key={c}
-                    className={sortable ? "sortable" : ""}
+                    className={`${sortable ? "sortable" : ""}${idx === 0 ? " sticky-col first" : ""}`}
                     aria-sort={ariaSort(c)}
                     tabIndex={sortable ? 0 : undefined}
                     role={sortable ? "button" : undefined}
@@ -268,76 +322,92 @@ export function ResultsTable({
             </tr>
           </thead>
           <tbody>
-            {rows.map((row, i) => (
-              <tr key={i}>
-                {fields.map((c) => (
-                  <td key={c} className={c === "Адрес" ? "addr" : ""}>
-                    {renderCell(c, row[c], tokens, row._rowid, mask)}
-                  </td>
-                ))}
-                <td className="row-actions">
-                  <button
-                    className="link-btn"
-                    title="Все данные о человеке"
-                    onClick={() => onDetails(row)}
-                  >
-                    Подробнее
-                  </button>
-                  {onConnections && (
+            {rows.map((row, i) => {
+              const rowid = Number(row._rowid);
+              const checked = selection?.ids.has(rowid) ?? false;
+              return (
+                <tr key={i} className={checked ? "row-selected" : ""}>
+                  {selection && (
+                    <td className="col-check sticky-col">
+                      <input type="checkbox" className="row-check" checked={checked}
+                        aria-label="Выбрать запись"
+                        onChange={() => selection.toggle(rowid)} />
+                    </td>
+                  )}
+                  {displayFields.map((c, idx) => (
+                    <td key={c} className={`${c === "Адрес" ? "addr" : ""}${idx === 0 ? " sticky-col first" : ""}`}>
+                      {renderCell(c, row[c], tokens, row._rowid, mask)}
+                    </td>
+                  ))}
+                  <td className="row-actions">
                     <button
                       className="link-btn"
-                      title="Родственники и связи по телефону"
+                      title="Все данные о человеке"
+                      onClick={() => onDetails(row)}
+                    >
+                      Подробнее
+                    </button>
+                    {onConnections && (
+                      <button
+                        className="link-btn"
+                        title="Родственники и связи по телефону"
+                        disabled={busy}
+                        onClick={() => onConnections(row)}
+                      >
+                        {pending?.kind === "conn" && pending.rowid === rowid && <Spin />} Связи
+                      </button>
+                    )}
+                    {onBookmark && (
+                      <button
+                        className="link-btn"
+                        title="Сохранить в закладки"
+                        onClick={() => onBookmark(row)}
+                      >
+                        <Icon name="star" size={15} />
+                      </button>
+                    )}
+                    <button
+                      className="link-btn"
+                      title="Скопировать все данные"
+                      onClick={() => copyResident(row, fields, push)}
+                    >
+                      Копировать
+                    </button>
+                    <button
+                      className="link-btn"
+                      title="Жители по этому адресу"
                       disabled={busy}
-                      onClick={() => onConnections(Number(row._rowid))}
+                      onClick={() => onNeighbors(rowid)}
                     >
-                      {pending?.kind === "conn" && pending.rowid === Number(row._rowid) && <Spin />} Связи
+                      {pending?.kind === "neigh" && pending.rowid === rowid && <Spin />} Соседи
                     </button>
-                  )}
-                  {onBookmark && (
-                    <button
-                      className="link-btn"
-                      title="Сохранить в закладки"
-                      onClick={() => onBookmark(row)}
-                    >
-                      <Icon name="star" size={15} />
-                    </button>
-                  )}
-                  <button
-                    className="link-btn"
-                    title="Скопировать все данные"
-                    onClick={() => copyResident(row, fields, push)}
-                  >
-                    Копировать
-                  </button>
-                  <button
-                    className="link-btn"
-                    title="Жители по этому адресу"
-                    disabled={busy}
-                    onClick={() => onNeighbors(Number(row._rowid))}
-                  >
-                    {pending?.kind === "neigh" && pending.rowid === Number(row._rowid) && <Spin />} Соседи
-                  </button>
-                </td>
-              </tr>
-            ))}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
 
       {/* Мобайл — карточки */}
       <div className="cards">
-        {rows.map((row, i) => (
-          <ResidentCard
-            key={i}
-            row={row}
-            fields={fields}
-            tokens={tokens}
-            onNeighbors={onNeighbors}
-            onConnections={onConnections}
-            onBookmark={onBookmark}
-            pending={pending}
-          />
-        ))}
+        {rows.map((row, i) => {
+          const rowid = Number(row._rowid);
+          return (
+            <ResidentCard
+              key={i}
+              row={row}
+              fields={fields}
+              tokens={tokens}
+              onNeighbors={onNeighbors}
+              onConnections={onConnections}
+              onBookmark={onBookmark}
+              pending={pending}
+              selected={selection?.ids.has(rowid)}
+              onToggleSelect={selection ? () => selection.toggle(rowid) : undefined}
+            />
+          );
+        })}
       </div>
     </>
   );
