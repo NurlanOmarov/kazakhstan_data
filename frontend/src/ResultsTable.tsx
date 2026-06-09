@@ -46,6 +46,15 @@ interface Props {
   onDetails: (row: Resident) => void;
   onConnections?: (rowid: number) => void;
   onBookmark?: (row: Resident) => void;
+  pending?: Pending;
+}
+
+/** Какая кнопка «Связи»/«Соседи» сейчас грузит данные (для спиннера и блокировки). */
+type Pending = { kind: "neigh" | "conn"; rowid: number } | null;
+
+/** Маленький встроенный спиннер для кнопок (анимация spin из App.css). */
+function Spin() {
+  return <span className="btn-spin" aria-hidden="true" />;
 }
 
 const NAME_FIELDS = ["Фамилия", "Имя", "Отчество"];
@@ -81,7 +90,7 @@ function MaskedCell({
  * Используется в мобильной выдаче и в модалке «Подробнее».
  */
 export function ResidentCard({
-  row, fields, tokens, onNeighbors, onConnections, onBookmark,
+  row, fields, tokens, onNeighbors, onConnections, onBookmark, pending,
 }: {
   row: Resident;
   fields: string[];
@@ -89,9 +98,14 @@ export function ResidentCard({
   onNeighbors: (rowid: number) => void;
   onConnections?: (rowid: number) => void;
   onBookmark?: (row: Resident) => void;
+  pending?: Pending;
 }) {
   const push = useToast();
   const mask = useMask();
+  const rowid = Number(row._rowid);
+  const busy = !!pending;
+  const connLoading = pending?.kind === "conn" && pending.rowid === rowid;
+  const neighLoading = pending?.kind === "neigh" && pending.rowid === rowid;
   return (
     <div className="card">
       <div className="card-name">
@@ -123,15 +137,20 @@ export function ResidentCard({
           </button>
         )}
         {onConnections && (
-          <button className="link-btn" onClick={() => onConnections(Number(row._rowid))}>
-            <Icon name="link" size={15} /> Связи
+          <button
+            className="link-btn"
+            disabled={busy}
+            onClick={() => onConnections(rowid)}
+          >
+            {connLoading ? <Spin /> : <Icon name="link" size={15} />} Связи
           </button>
         )}
         <button
           className="link-btn card-neighbors"
-          onClick={() => onNeighbors(Number(row._rowid))}
+          disabled={busy}
+          onClick={() => onNeighbors(rowid)}
         >
-          Жители по этому адресу
+          {neighLoading && <Spin />} Жители по этому адресу
         </button>
       </div>
     </div>
@@ -193,10 +212,11 @@ function renderCell(
 
 export function ResultsTable({
   rows, fields, tokens, sortBy, sortDir, onSort, onNeighbors, onDetails,
-  onConnections, onBookmark,
+  onConnections, onBookmark, pending,
 }: Props) {
   const push = useToast();
   const mask = useMask();
+  const busy = !!pending;
   const sortGlyph = (c: string) => {
     if (!SORTABLE.has(c)) return null;
     const active = sortBy === c;
@@ -267,9 +287,10 @@ export function ResultsTable({
                     <button
                       className="link-btn"
                       title="Родственники и связи по телефону"
+                      disabled={busy}
                       onClick={() => onConnections(Number(row._rowid))}
                     >
-                      Связи
+                      {pending?.kind === "conn" && pending.rowid === Number(row._rowid) && <Spin />} Связи
                     </button>
                   )}
                   {onBookmark && (
@@ -291,9 +312,10 @@ export function ResultsTable({
                   <button
                     className="link-btn"
                     title="Жители по этому адресу"
+                    disabled={busy}
                     onClick={() => onNeighbors(Number(row._rowid))}
                   >
-                    Соседи
+                    {pending?.kind === "neigh" && pending.rowid === Number(row._rowid) && <Spin />} Соседи
                   </button>
                 </td>
               </tr>
@@ -313,6 +335,7 @@ export function ResultsTable({
             onNeighbors={onNeighbors}
             onConnections={onConnections}
             onBookmark={onBookmark}
+            pending={pending}
           />
         ))}
       </div>

@@ -126,6 +126,8 @@ export function SearchPage() {
   const [neighSort, setNeighSort] = useState<"apt" | "name" | "dob" | "family">("apt");
   const [detail, setDetail] = useState<{ row: Resident; fields: string[] } | null>(null);
   const [conn, setConn] = useState<Connections | null>(null);
+  // Какая кнопка «Связи»/«Соседи» сейчас грузится — для спиннера и защиты от двойных кликов.
+  const [pending, setPending] = useState<{ kind: "neigh" | "conn"; rowid: number } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => { myHistory().then(setHistory).catch(() => {}); }, []);
@@ -191,6 +193,7 @@ export function SearchPage() {
     setNeighbors(null);
     setDetail(null);
     setConn(null);
+    setPending(null);
   };
 
   const switchMode = (m: "people" | "address") => {
@@ -210,7 +213,9 @@ export function SearchPage() {
   const gotoPage = (p: number) => run(params, { _page: p });
 
   const openNeighbors = async (rowid: number) => {
+    if (pending) return; // уже идёт запрос — игнорируем повторные клики
     setConn(null);
+    setPending({ kind: "neigh", rowid });
     try {
       const res = await fetchNeighbors(rowid);
       const hasApt = res.results.some((r) => apartmentOf(r["Адрес"]));
@@ -219,14 +224,20 @@ export function SearchPage() {
     } catch {
       setNeighSort("name");
       setNeighbors({ rows: [], total: 0, fields: [] });
+    } finally {
+      setPending(null);
     }
   };
 
   const openConnections = async (rowid: number) => {
+    if (pending) return; // уже идёт запрос — игнорируем повторные клики
+    setPending({ kind: "conn", rowid });
     try {
       setConn(await fetchConnections(rowid));
     } catch {
       toast("Не удалось загрузить связи", "err");
+    } finally {
+      setPending(null);
     }
   };
 
@@ -353,7 +364,7 @@ export function SearchPage() {
         data={data} loading={loading} error={error} tokens={tokens}
         sortBy={sortBy} sortDir={sortDir} onSort={onSort}
         onNeighbors={openNeighbors} onDetails={(row) => setDetail({ row, fields: data?.fields ?? [] })}
-        onConnections={openConnections} onBookmark={bookmark}
+        onConnections={openConnections} onBookmark={bookmark} pending={pending}
         page={page} totalPages={totalPages} gotoPage={gotoPage}
       />
 
@@ -501,10 +512,11 @@ function Results(props: {
   onDetails: (row: Resident) => void;
   onConnections: (rowid: number) => void;
   onBookmark: (row: Resident) => void;
+  pending: { kind: "neigh" | "conn"; rowid: number } | null;
   page: number; totalPages: number; gotoPage: (p: number) => void;
 }) {
   const { data, loading, error, tokens, sortBy, sortDir, onSort, onNeighbors,
-          onDetails, onConnections, onBookmark, page, totalPages, gotoPage } = props;
+          onDetails, onConnections, onBookmark, pending, page, totalPages, gotoPage } = props;
 
   if (error) return <p className="meta err"><Icon name="alert" size={16} /> {error}</p>;
   if (loading && !data) return <div className="empty">Идёт поиск…</div>;
@@ -547,7 +559,7 @@ function Results(props: {
           rows={data.results} fields={data.fields} tokens={tokens}
           sortBy={sortBy} sortDir={sortDir} onSort={onSort}
           onNeighbors={onNeighbors} onDetails={onDetails}
-          onConnections={onConnections} onBookmark={onBookmark}
+          onConnections={onConnections} onBookmark={onBookmark} pending={pending}
         />
       </div>
       {totalPages > 1 && (

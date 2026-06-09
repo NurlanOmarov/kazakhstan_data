@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Icon } from "./Icon";
 import { useAuth } from "./auth";
 import { ApiError } from "./api";
+import { MatrixRain } from "./MatrixRain";
 
 export function Login() {
   const { login } = useAuth();
@@ -29,6 +30,7 @@ export function Login() {
 
   return (
     <div className="login-wrap">
+      <MatrixRain />
       <form className="login-card" onSubmit={submit}>
         <div className="login-logo" aria-hidden="true"><Icon name="lock" size={32} /></div>
         <h1>Вход в систему</h1>
