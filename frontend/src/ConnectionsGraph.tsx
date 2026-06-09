@@ -32,6 +32,10 @@ interface NodeMeta {
   relation: string;
   r: number;
   tone: string; // CSS-класс цвета
+  // Размещение подписи (вычисляется по углу узла, чтобы текст уходил наружу).
+  labelDx: number;
+  labelDy: number;
+  labelAnchor: "start" | "middle" | "end";
 }
 
 interface PhysNode extends NodeMeta {
@@ -52,9 +56,10 @@ function shortLabel(row: Resident | null): string {
   if (!row) return "—";
   const s = String(row["Фамилия"] ?? "").trim();
   const n = String(row["Имя"] ?? "").trim();
-  const p = String(row["Отчество"] ?? "").trim();
-  const initials = [n, p].filter(Boolean).map((x) => x[0].toUpperCase() + ".").join(" ");
-  return [s, initials].filter(Boolean).join(" ") || n || "—";
+  // Фамилия + полное имя (отличает однофамильцев лучше инициалов), с обрезкой.
+  let label = [s, n].filter(Boolean).join(" ") || n || "—";
+  if (label.length > 20) label = label.slice(0, 19) + "…";
+  return label;
 }
 
 function subLabel(row: Resident | null): string {
@@ -76,7 +81,9 @@ function relationTone(relation: string): string {
 function buildNodes(root: Root): { center: NodeMeta; sats: NodeMeta[] } {
   const center: NodeMeta = {
     id: "center", kind: "center", rowid: root.rowid, row: root.row,
-    label: root.label, sub: subLabel(root.row), relation: "", r: 34, tone: "center",
+    label: shortLabel(root.row) || root.label, sub: subLabel(root.row),
+    relation: "", r: 34, tone: "center",
+    labelDx: 0, labelDy: 52, labelAnchor: "middle",
   };
   const sats: NodeMeta[] = [];
   root.data.relatives.slice(0, MAX_PER_GROUP).forEach((row, i) => {
@@ -85,6 +92,7 @@ function buildNodes(root: Root): { center: NodeMeta; sats: NodeMeta[] } {
       id: `r${row._rowid}_${i}`, kind: "relative", rowid: Number(row._rowid),
       row, label: shortLabel(row), sub: subLabel(row), relation,
       r: 17, tone: relationTone(relation),
+      labelDx: 0, labelDy: 31, labelAnchor: "middle",
     });
   });
   root.data.phone.slice(0, MAX_PER_GROUP).forEach((row, i) => {
@@ -92,23 +100,27 @@ function buildNodes(root: Root): { center: NodeMeta; sats: NodeMeta[] } {
       id: `p${row._rowid}_${i}`, kind: "phone", rowid: Number(row._rowid),
       row, label: shortLabel(row), sub: subLabel(row), relation: "тот же телефон",
       r: 17, tone: "phone",
+      labelDx: 0, labelDy: 31, labelAnchor: "middle",
     });
   });
   return { center, sats };
 }
 
 /** Радиальная раскладка по кольцам — «взрыв» лучей из центра. */
-function layout(sats: NodeMeta[]): { id: string; tx: number; ty: number }[] {
-  const out: { id: string; tx: number; ty: number }[] = [];
-  const base = 96, step = 74;
-  let ring = 0, placed = 0, cap = 7;
+function layout(sats: NodeMeta[]): { id: string; tx: number; ty: number; angle: number }[] {
+  const out: { id: string; tx: number; ty: number; angle: number }[] = [];
+  const base = 118, step = 88;
+  // Первое кольцо вмещает все узлы, если их немного (равномерно по кругу),
+  // иначе до 9, остальные — на внешних кольцах.
+  let ring = 0, placed = 0, cap = Math.min(Math.max(sats.length, 1), 9);
   for (let i = 0; i < sats.length; i++) {
-    const angle = (placed / cap) * Math.PI * 2 + ring * 0.6 - Math.PI / 2;
+    const angle = (placed / cap) * Math.PI * 2 + ring * 0.5 - Math.PI / 2;
     const radius = base + ring * step;
     out.push({
       id: sats[i].id,
       tx: CX + radius * Math.cos(angle),
-      ty: CY + radius * Math.sin(angle) * 0.82,
+      ty: CY + radius * Math.sin(angle) * 0.84,
+      angle,
     });
     placed++;
     if (placed >= cap) { ring++; placed = 0; cap = Math.round(cap * 1.7); }
@@ -128,7 +140,21 @@ export function ConnectionsGraph({
   const [loading, setLoading] = useState(false);
   const [hover, setHover] = useState<string | null>(null);
 
-  const { center, sats } = useMemo(() => buildNodes(root), [root]);
+  const { center, sats, posById } = useMemo(() => {
+    const built = buildNodes(root);
+    const pos = layout(built.sats);
+    const byId = new Map(pos.map((p) => [p.id, p]));
+    // Подпись уходит радиально наружу: текст вправо/влево от узла и выше/ниже,
+    // чтобы не наезжать на центр и соседей.
+    for (const s of built.sats) {
+      const p = byId.get(s.id)!;
+      const ca = Math.cos(p.angle), sa = Math.sin(p.angle);
+      s.labelAnchor = ca > 0.4 ? "start" : ca < -0.4 ? "end" : "middle";
+      s.labelDx = Math.round(ca * (s.r + 6));
+      s.labelDy = sa < -0.35 ? -(s.r + 9) : (s.r + 17);
+    }
+    return { center: built.center, sats: built.sats, posById: byId };
+  }, [root]);
 
   // Физика живёт в ref, чтобы не дёргать React-рендер на каждом кадре.
   const physRef = useRef<PhysNode[]>([]);
@@ -215,8 +241,6 @@ export function ConnectionsGraph({
   // Перестроить физические узлы при смене корня (вылетают из центра).
   useEffect(() => {
     resetCam(); // новый корень — возвращаем камеру в исходный масштаб/центр
-    const pos = layout(sats);
-    const posById = new Map(pos.map((p) => [p.id, p]));
     const now = performance.now();
     physRef.current = sats.map((m, i) => {
       const p = posById.get(m.id)!;
@@ -228,7 +252,7 @@ export function ConnectionsGraph({
         ctrl: (i % 2 === 0 ? 1 : -1) * (18 + (i % 5) * 6),
       };
     });
-  }, [sats]);
+  }, [sats, posById]);
 
   // Анимационный цикл: пружина к цели + лёгкий дрейф + проявление.
   useEffect(() => {
@@ -346,7 +370,8 @@ export function ConnectionsGraph({
                 <title>{`${n.label}${n.sub ? " · " + n.sub : ""}${n.relation ? "\n" + n.relation : ""}\n(клик — раскрыть связи)`}</title>
                 <circle className="cnode-halo" r={n.r + 6} />
                 <circle className="cnode-core" r={n.r} />
-                <text className="cnode-label" y={n.r + 14}>{n.label}</text>
+                <text className="cnode-label" x={n.labelDx} y={n.labelDy}
+                  textAnchor={n.labelAnchor}>{n.label}</text>
               </g>
             ))}
 
